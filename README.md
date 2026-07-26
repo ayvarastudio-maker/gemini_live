@@ -17,10 +17,10 @@ npm start
 Set in Flutter `.env`:
 
 ```
-LIVE_PROXY_BASE_URL=http://10.0.2.2:8787
+LIVE_PROXY_BASE_URL=wss://gemini-live-3b9i.onrender.com
 ```
 
-(Use your machine LAN IP for a physical Android device, e.g. `http://192.168.1.10:8787`.)
+(WebSocket connects to the same host with `wss://`; session HTTP uses the Render HTTPS origin from this base URL in the app.)
 
 ## Security
 
