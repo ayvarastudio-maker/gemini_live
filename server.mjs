@@ -29,7 +29,8 @@ let geminiOutboundRequestCount = 0;
 const LOG_TAG_REQ = '[GEMINI_REQ_LOG]';
 const LOG_TAG_PROXY = '[GEMINI_PROXY_LOG]';
 const LOG_TAG_VOICE = '[VOICE_FLOW_LOG]';
-const LOG_TAG_CLOSE = '[SESSION_CLOSE_DIAG]';
+const LOG_TAG_SETUP = '[GEMINI_SETUP_LOG]';
+const EXPECTED_INPUT_MIME = 'audio/pcm;rate=16000';
 
 function safeErrorPayload(err) {
   if (err == null) return 'null';
@@ -157,10 +158,19 @@ function guardGeminiLiveTransport(liveSession, meta) {
     return;
   }
   const originalSend = conn.send.bind(conn);
+  let setupWireLogged = false;
   conn.send = (message) => {
     if (typeof message === 'string') {
       try {
         const parsed = JSON.parse(message);
+        if (parsed?.setup && !setupWireLogged) {
+          setupWireLogged = true;
+          console.log(
+            `${LOG_TAG_SETUP} ts=${logTimestamp()} event=setup_wire_send ` +
+              `clientWsId=${meta.clientWsId} liveSessionId=${meta.liveSessionId} ` +
+              `payload=${JSON.stringify(redactLiveWireJson(parsed))}`,
+          );
+        }
         if (parsed?.type === 'close' || parsed?.close != null) {
           logProxyLifecycle('BLOCKED_LEGACY_GEMINI_CLOSE_PAYLOAD', {
             ...meta,
@@ -224,22 +234,123 @@ async function shutdownGeminiLiveSession(
   }
 }
 
-function buildLiveConnectConfig(session) {
-  const config = {
+function modelResourceName() {
+  const bare = LIVE_MODEL.replace(/^models\//, '');
+  return `models/${bare}`;
+}
+
+/** Minimum Live setup — matches official BidiGenerateContentSetup (no optional fields). */
+function buildMinimalLiveConnectConfig() {
+  return {
     responseModalities: [Modality.AUDIO],
-    inputAudioTranscription: {},
-    outputAudioTranscription: {},
-    systemInstruction: {
-      parts: [{ text: session.config.systemInstruction }],
+  };
+}
+
+function minimalSetupPayloadForLog() {
+  return {
+    setup: {
+      model: modelResourceName(),
+      generationConfig: {
+        responseModalities: ['AUDIO'],
+      },
     },
   };
-  // Native-audio Live models reject legacy prebuilt TTS voice config.
-  if (!LIVE_MODEL.includes('native-audio')) {
-    config.speechConfig = {
-      voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
-    };
+}
+
+function redactLiveWireJson(value) {
+  if (value == null) return value;
+  if (typeof value === 'string') {
+    if (value.length > 120) {
+      return `<string len=${value.length} redacted>`;
+    }
+    return value;
   }
-  return config;
+  if (Array.isArray(value)) {
+    return value.map((item) => redactLiveWireJson(item));
+  }
+  if (typeof value !== 'object') return value;
+
+  const out = {};
+  for (const [key, raw] of Object.entries(value)) {
+    const lower = key.toLowerCase();
+    if (
+      lower.includes('key') ||
+      lower === 'data' ||
+      lower === 'audiobytes' ||
+      lower.includes('image') ||
+      lower.includes('base64')
+    ) {
+      if (typeof raw === 'string') {
+        out[key] = `<redacted len=${raw.length}>`;
+      } else {
+        out[key] = '<redacted>';
+      }
+      continue;
+    }
+    out[key] = redactLiveWireJson(raw);
+  }
+  return out;
+}
+
+function logMinimalSetupPayload(meta) {
+  const payload = minimalSetupPayloadForLog();
+  console.log(
+    `${LOG_TAG_SETUP} ts=${logTimestamp()} event=setup_payload_outbound ` +
+      `clientWsId=${meta.clientWsId} liveSessionId=${meta.liveSessionId} ` +
+      `payload=${JSON.stringify(redactLiveWireJson(payload))}`,
+  );
+}
+
+function logSetupComplete(meta) {
+  console.log(
+    `${LOG_TAG_SETUP} ts=${logTimestamp()} event=setupComplete_received ` +
+      `clientWsId=${meta.clientWsId} liveSessionId=${meta.liveSessionId}`,
+  );
+}
+
+function logFirstAudioAfterSetupComplete(meta, byteLength) {
+  console.log(
+    `${LOG_TAG_SETUP} ts=${logTimestamp()} event=first_audio_after_setupComplete ` +
+      `clientWsId=${meta.clientWsId} liveSessionId=${meta.liveSessionId} pcmBytes=${byteLength}`,
+  );
+}
+
+/**
+ * Validates Flutter uplink: single base64 layer, raw PCM16 LE mono (no WAV container).
+ */
+function validateIncomingPcm16Base64(b64, mimeType) {
+  if (typeof b64 !== 'string' || b64.length === 0) {
+    throw new Error('Audio data must be a non-empty base64 string.');
+  }
+  if (mimeType && mimeType !== EXPECTED_INPUT_MIME) {
+    throw new Error(
+      `Unsupported audio mimeType "${mimeType}" (expected ${EXPECTED_INPUT_MIME}).`,
+    );
+  }
+  let buf;
+  try {
+    buf = Buffer.from(b64, 'base64');
+  } catch {
+    throw new Error('Audio data is not valid base64.');
+  }
+  if (buf.length === 0) {
+    throw new Error('Decoded audio is empty.');
+  }
+  if (buf.length % 2 !== 0) {
+    throw new Error(
+      `PCM16 frame must have even byte length (got ${buf.length}).`,
+    );
+  }
+  if (
+    buf.length >= 4 &&
+    buf[0] === 0x52 &&
+    buf[1] === 0x49 &&
+    buf[2] === 0x46 &&
+    buf[3] === 0x46
+  ) {
+    throw new Error('WAV header detected; send raw PCM16 only.');
+  }
+  return buf.length;
 }
 
 const app = express();
@@ -328,6 +439,72 @@ wss.on('connection', async (clientWs, session, token) => {
   let geminiSessionClosed = false;
   let micReadySent = false;
   let micReadyFallbackTimer = null;
+  let geminiSetupComplete = false;
+  let firstGeminiAudioForwarded = false;
+  let initialContextSeeded = false;
+
+  const seedInitialContext = async () => {
+    if (!liveSession || initialContextSeeded) return;
+    initialContextSeeded = true;
+
+    if (session.config.imageBase64) {
+      await geminiSendClientContent(
+        liveSession,
+        {
+          turns: [
+            {
+              role: 'user',
+              parts: [
+                {
+                  inlineData: {
+                    mimeType: session.config.imageMimeType,
+                    data: session.config.imageBase64,
+                  },
+                },
+              ],
+            },
+          ],
+          turnComplete: true,
+        },
+        geminiMeta(),
+      );
+    }
+
+    for (const line of session.config.priorTranscript ?? []) {
+      if (!line?.text) continue;
+      await geminiSendClientContent(
+        liveSession,
+        {
+          turns: [
+            {
+              role: line.role === 'user' ? 'user' : 'model',
+              parts: [{ text: line.text }],
+            },
+          ],
+          turnComplete: true,
+        },
+        geminiMeta(),
+      );
+    }
+
+    if (session.config.initialAnalysisText?.trim()) {
+      await geminiSendClientContent(
+        liveSession,
+        {
+          turns: [
+            {
+              role: 'user',
+              parts: [{ text: session.config.initialAnalysisText.trim() }],
+            },
+          ],
+          turnComplete: true,
+        },
+        geminiMeta(),
+      );
+    }
+
+    scheduleMicReadyFallback();
+  };
 
   const sendMicReadyOnce = () => {
     if (micReadySent) return;
@@ -416,13 +593,151 @@ wss.on('connection', async (clientWs, session, token) => {
 
   const pushState = (state) => sendClient(clientWs, { type: 'state', state });
 
+  clientWs.on('message', async (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      switch (msg.type) {
+        case 'audio':
+          if (paused || !liveSession) break;
+          if (!geminiSetupComplete) {
+            logVoiceFlow('audio_chunk_dropped_before_setupComplete', {
+              clientWsId,
+              liveSessionId,
+            });
+            break;
+          }
+          flutterAudioChunksIn += 1;
+          {
+            const mimeType = EXPECTED_INPUT_MIME;
+            const pcmBytes = validateIncomingPcm16Base64(msg.data, mimeType);
+            if (!firstGeminiAudioForwarded) {
+              logFirstAudioAfterSetupComplete(geminiMeta(), pcmBytes);
+              firstGeminiAudioForwarded = true;
+            }
+            if (
+              flutterAudioChunksIn === 1 ||
+              flutterAudioChunksIn % 50 === 0
+            ) {
+              logVoiceFlow('audio_chunk_received_from_flutter', {
+                clientWsId,
+                liveSessionId,
+                extra: `bytes=${pcmBytes} chunkIndex=${flutterAudioChunksIn}`,
+              });
+            }
+            await geminiSendRealtimeInput(
+              liveSession,
+              {
+                audio: {
+                  data: msg.data,
+                  mimeType,
+                },
+              },
+              geminiMeta(),
+              'audio',
+            );
+            if (
+              flutterAudioChunksIn === 1 ||
+              flutterAudioChunksIn % 50 === 0
+            ) {
+              logVoiceFlow('audio_chunk_sent_to_gemini', {
+                clientWsId,
+                liveSessionId,
+                extra: `chunkIndex=${flutterAudioChunksIn}`,
+              });
+            }
+          }
+          if (!modelSpeaking) pushState('Dinliyorum');
+          break;
+        case 'text':
+          if (!geminiSetupComplete) break;
+          await geminiSendClientContent(
+            liveSession,
+            {
+              turns: [{ role: 'user', parts: [{ text: msg.text }] }],
+              turnComplete: true,
+            },
+            geminiMeta(),
+          );
+          pushState('Düşünüyor');
+          break;
+        case 'audioStreamEnd':
+          if (!geminiSetupComplete) break;
+          await geminiSendRealtimeInput(
+            liveSession,
+            { audioStreamEnd: true },
+            geminiMeta(),
+            'audioStreamEnd',
+          );
+          pushState('Dinliyorum');
+          break;
+        case 'interrupt':
+          if (!geminiSetupComplete) break;
+          await geminiSendRealtimeInput(
+            liveSession,
+            { audioStreamEnd: true },
+            geminiMeta(),
+            'audioStreamEnd',
+          );
+          modelSpeaking = false;
+          pushState('Dinliyorum');
+          break;
+        case 'pause':
+          paused = true;
+          pushState('Duraklatıldı');
+          break;
+        case 'resume':
+          paused = false;
+          pushState('Dinliyorum');
+          break;
+        case 'reconnect':
+          if (session.reconnectUsed) {
+            sendClient(clientWs, {
+              type: 'error',
+              message: 'Reconnect limit reached',
+            });
+            return;
+          }
+          session.reconnectUsed = true;
+          sendClient(clientWs, { type: 'reconnected' });
+          pushState('Dinliyorum');
+          break;
+        case 'close':
+        case 'disconnect':
+          proxyClosingGemini = true;
+          await shutdownGeminiLiveSession(liveSession, geminiMeta(), {
+            signalAudioStreamEnd: true,
+          });
+          liveSession = null;
+          sendClient(clientWs, { type: 'closed' });
+          break;
+        default:
+          break;
+      }
+    } catch (err) {
+      lastGeminiErrorPayload = safeErrorPayload(err);
+      logSessionClose({
+        initiator: 'client_message_handler_error',
+        clientWsId,
+        liveSessionId,
+        geminiErrorPayload: lastGeminiErrorPayload,
+        stackTrace: err?.stack ?? captureStackTrace(),
+        flutterRequestedDisconnect: false,
+        geminiClosedSession: geminiSessionClosed,
+        proxyClosedClient: proxyClosingClient,
+        proxyClosedGemini: proxyClosingGemini,
+      });
+      sendClient(clientWs, { type: 'error', message: String(err) });
+    }
+  });
+
   try {
     pushState('Bağlanıyor');
 
+    logMinimalSetupPayload(geminiMeta());
     logGeminiOutbound('gemini.live.connect', geminiMeta());
     liveSession = await ai.live.connect({
       model: LIVE_MODEL,
-      config: buildLiveConnectConfig(session),
+      config: buildMinimalLiveConnectConfig(),
       callbacks: {
         onopen: () => {
           logProxyLifecycle('GEMINI_LIVE_SESSION_START', {
@@ -436,6 +751,18 @@ wss.on('connection', async (clientWs, session, token) => {
           pushState('Düşünüyor');
         },
         onmessage: (message) => {
+          if (message.setupComplete && !geminiSetupComplete) {
+            geminiSetupComplete = true;
+            logSetupComplete(geminiMeta());
+            void seedInitialContext().catch((err) => {
+              lastGeminiErrorPayload = safeErrorPayload(err);
+              sendClient(clientWs, {
+                type: 'error',
+                message: String(err),
+              });
+            });
+          }
+
           if (message.serverContent?.interrupted) {
             modelSpeaking = false;
             pushState('Dinliyorum');
@@ -558,187 +885,6 @@ wss.on('connection', async (clientWs, session, token) => {
       },
     });
     guardGeminiLiveTransport(liveSession, geminiMeta());
-
-    // Image once at session start, then written context, then voice kickoff prompt.
-    if (session.config.imageBase64) {
-      await geminiSendClientContent(
-        liveSession,
-        {
-          turns: [
-            {
-              role: 'user',
-              parts: [
-                {
-                  inlineData: {
-                    mimeType: session.config.imageMimeType,
-                    data: session.config.imageBase64,
-                  },
-                },
-              ],
-            },
-          ],
-          turnComplete: true,
-        },
-        geminiMeta(),
-      );
-    }
-
-    for (const line of session.config.priorTranscript ?? []) {
-      if (!line?.text) continue;
-      await geminiSendClientContent(
-        liveSession,
-        {
-          turns: [
-            {
-              role: line.role === 'user' ? 'user' : 'model',
-              parts: [{ text: line.text }],
-            },
-          ],
-          turnComplete: true,
-        },
-        geminiMeta(),
-      );
-    }
-
-    if (session.config.initialAnalysisText?.trim()) {
-      await geminiSendClientContent(
-        liveSession,
-        {
-          turns: [
-            {
-              role: 'user',
-              parts: [{ text: session.config.initialAnalysisText.trim() }],
-            },
-          ],
-          turnComplete: true,
-        },
-        geminiMeta(),
-      );
-    }
-
-    scheduleMicReadyFallback();
-
-    clientWs.on('message', async (raw) => {
-      try {
-        const msg = JSON.parse(raw.toString());
-        switch (msg.type) {
-          case 'audio':
-            if (paused) break;
-            flutterAudioChunksIn += 1;
-            {
-              const inBytes = audioByteLengthBase64(msg.data);
-              if (
-                flutterAudioChunksIn === 1 ||
-                flutterAudioChunksIn % 50 === 0
-              ) {
-                logVoiceFlow('audio_chunk_received_from_flutter', {
-                  clientWsId,
-                  liveSessionId,
-                  extra: `bytes=${inBytes} chunkIndex=${flutterAudioChunksIn}`,
-                });
-              }
-            }
-            await geminiSendRealtimeInput(
-              liveSession,
-              {
-                audio: {
-                  data: msg.data,
-                  mimeType: msg.mimeType || 'audio/pcm;rate=16000',
-                },
-              },
-              geminiMeta(),
-              'audio',
-            );
-            if (
-              flutterAudioChunksIn === 1 ||
-              flutterAudioChunksIn % 50 === 0
-            ) {
-              logVoiceFlow('audio_chunk_sent_to_gemini', {
-                clientWsId,
-                liveSessionId,
-                extra: `chunkIndex=${flutterAudioChunksIn}`,
-              });
-            }
-            if (!modelSpeaking) pushState('Dinliyorum');
-            break;
-          case 'text':
-            await geminiSendClientContent(
-              liveSession,
-              {
-                turns: [{ role: 'user', parts: [{ text: msg.text }] }],
-                turnComplete: true,
-              },
-              geminiMeta(),
-            );
-            pushState('Düşünüyor');
-            break;
-          case 'audioStreamEnd':
-            await geminiSendRealtimeInput(
-              liveSession,
-              { audioStreamEnd: true },
-              geminiMeta(),
-              'audioStreamEnd',
-            );
-            pushState('Dinliyorum');
-            break;
-          case 'interrupt':
-            await geminiSendRealtimeInput(
-              liveSession,
-              { audioStreamEnd: true },
-              geminiMeta(),
-              'audioStreamEnd',
-            );
-            modelSpeaking = false;
-            pushState('Dinliyorum');
-            break;
-          case 'pause':
-            paused = true;
-            pushState('Duraklatıldı');
-            break;
-          case 'resume':
-            paused = false;
-            pushState('Dinliyorum');
-            break;
-          case 'reconnect':
-            if (session.reconnectUsed) {
-              sendClient(clientWs, {
-                type: 'error',
-                message: 'Reconnect limit reached',
-              });
-              return;
-            }
-            session.reconnectUsed = true;
-            sendClient(clientWs, { type: 'reconnected' });
-            pushState('Dinliyorum');
-            break;
-          case 'close':
-          case 'disconnect':
-            proxyClosingGemini = true;
-            await shutdownGeminiLiveSession(liveSession, geminiMeta(), {
-              signalAudioStreamEnd: true,
-            });
-            liveSession = null;
-            sendClient(clientWs, { type: 'closed' });
-            break;
-          default:
-            break;
-        }
-      } catch (err) {
-        lastGeminiErrorPayload = safeErrorPayload(err);
-        logSessionClose({
-          initiator: 'client_message_handler_error',
-          clientWsId,
-          liveSessionId,
-          geminiErrorPayload: lastGeminiErrorPayload,
-          stackTrace: err?.stack ?? captureStackTrace(),
-          flutterRequestedDisconnect: false,
-          geminiClosedSession: geminiSessionClosed,
-          proxyClosedClient: proxyClosingClient,
-          proxyClosedGemini: proxyClosingGemini,
-        });
-        sendClient(clientWs, { type: 'error', message: String(err) });
-      }
-    });
   } catch (err) {
     logSessionClose({
       initiator: 'proxy_connection_setup_error',
