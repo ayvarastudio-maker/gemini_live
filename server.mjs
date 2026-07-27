@@ -29,6 +29,7 @@ let geminiOutboundRequestCount = 0;
 const LOG_TAG_REQ = '[GEMINI_REQ_LOG]';
 const LOG_TAG_PROXY = '[GEMINI_PROXY_LOG]';
 const LOG_TAG_VOICE = '[VOICE_FLOW_LOG]';
+const LOG_TAG_CLOSE = '[SESSION_CLOSE_DIAG]';
 const LOG_TAG_SPEECH_DIAG = '[GEMINI_SPEECH_DIAG]';
 const LOG_TAG_SETUP = '[GEMINI_SETUP_LOG]';
 const EXPECTED_INPUT_MIME = 'audio/pcm;rate=16000';
@@ -338,6 +339,20 @@ function logSetupComplete(meta) {
   );
 }
 
+function logFirstFlutterAudioChunk(meta, byteLength) {
+  console.log(
+    `${LOG_TAG_SETUP} ts=${logTimestamp()} event=first_flutter_audio_chunk_received ` +
+      `clientWsId=${meta.clientWsId} liveSessionId=${meta.liveSessionId} pcmBytes=${byteLength}`,
+  );
+}
+
+function logFirstAudioForwardedToGemini(meta, byteLength) {
+  console.log(
+    `${LOG_TAG_SETUP} ts=${logTimestamp()} event=first_audio_forwarded_to_gemini ` +
+      `clientWsId=${meta.clientWsId} liveSessionId=${meta.liveSessionId} pcmBytes=${byteLength}`,
+  );
+}
+
 function logFirstAudioAfterSetupComplete(meta, byteLength) {
   console.log(
     `${LOG_TAG_SETUP} ts=${logTimestamp()} event=first_audio_after_setupComplete ` +
@@ -471,69 +486,18 @@ wss.on('connection', async (clientWs, session, token) => {
   let micReadyFallbackTimer = null;
   let geminiSetupComplete = false;
   let firstGeminiAudioForwarded = false;
-  let initialContextSeeded = false;
+  let firstFlutterAudioLogged = false;
+  let firstAudioForwardedLogged = false;
+  let setupCompleteHandled = false;
 
-  const seedInitialContext = async () => {
-    if (!liveSession || initialContextSeeded) return;
-    initialContextSeeded = true;
-
-    if (session.config.imageBase64) {
-      await geminiSendClientContent(
-        liveSession,
-        {
-          turns: [
-            {
-              role: 'user',
-              parts: [
-                {
-                  inlineData: {
-                    mimeType: session.config.imageMimeType,
-                    data: session.config.imageBase64,
-                  },
-                },
-              ],
-            },
-          ],
-          turnComplete: true,
-        },
-        geminiMeta(),
-      );
-    }
-
-    for (const line of session.config.priorTranscript ?? []) {
-      if (!line?.text) continue;
-      await geminiSendClientContent(
-        liveSession,
-        {
-          turns: [
-            {
-              role: line.role === 'user' ? 'user' : 'model',
-              parts: [{ text: line.text }],
-            },
-          ],
-          turnComplete: true,
-        },
-        geminiMeta(),
-      );
-    }
-
-    if (session.config.initialAnalysisText?.trim()) {
-      await geminiSendClientContent(
-        liveSession,
-        {
-          turns: [
-            {
-              role: 'user',
-              parts: [{ text: session.config.initialAnalysisText.trim() }],
-            },
-          ],
-          turnComplete: true,
-        },
-        geminiMeta(),
-      );
-    }
-
-    scheduleMicReadyFallback();
+  const onGeminiSetupComplete = () => {
+    if (setupCompleteHandled) return;
+    setupCompleteHandled = true;
+    logVoiceFlow('initial_client_content_seed_disabled', {
+      clientWsId,
+      liveSessionId,
+    });
+    sendMicReadyOnce();
   };
 
   const sendMicReadyOnce = () => {
@@ -651,6 +615,10 @@ wss.on('connection', async (clientWs, session, token) => {
                 pcmBytes,
               });
             }
+            if (flutterAudioChunksIn === 1 && !firstFlutterAudioLogged) {
+              firstFlutterAudioLogged = true;
+              logFirstFlutterAudioChunk(geminiMeta(), pcmBytes);
+            }
             if (!firstGeminiAudioForwarded) {
               logFirstAudioAfterSetupComplete(geminiMeta(), pcmBytes);
               firstGeminiAudioForwarded = true;
@@ -676,6 +644,10 @@ wss.on('connection', async (clientWs, session, token) => {
               geminiMeta(),
               'audio',
             );
+            if (!firstAudioForwardedLogged) {
+              firstAudioForwardedLogged = true;
+              logFirstAudioForwardedToGemini(geminiMeta(), pcmBytes);
+            }
             if (shouldLogChunk) {
               logSpeechDiag('gemini_audio_chunk_forwarded', geminiMeta(), {
                 chunkIndex: flutterAudioChunksIn,
@@ -823,13 +795,7 @@ wss.on('connection', async (clientWs, session, token) => {
           if (message.setupComplete && !geminiSetupComplete) {
             geminiSetupComplete = true;
             logSetupComplete(geminiMeta());
-            void seedInitialContext().catch((err) => {
-              lastGeminiErrorPayload = safeErrorPayload(err);
-              sendClient(clientWs, {
-                type: 'error',
-                message: String(err),
-              });
-            });
+            onGeminiSetupComplete();
           }
 
           if (message.serverContent?.interrupted) {
