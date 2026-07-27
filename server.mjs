@@ -29,6 +29,78 @@ let geminiOutboundRequestCount = 0;
 const LOG_TAG_REQ = '[GEMINI_REQ_LOG]';
 const LOG_TAG_PROXY = '[GEMINI_PROXY_LOG]';
 const LOG_TAG_VOICE = '[VOICE_FLOW_LOG]';
+const LOG_TAG_CLOSE = '[SESSION_CLOSE_DIAG]';
+
+function safeErrorPayload(err) {
+  if (err == null) return 'null';
+  if (typeof err === 'string') return err;
+  try {
+    return JSON.stringify({
+      name: err.name,
+      message: err.message,
+      code: err.code,
+      status: err.status,
+      statusText: err.statusText,
+      reason: err.reason,
+      type: err.type,
+      stack: err.stack,
+    });
+  } catch {
+    return String(err);
+  }
+}
+
+function safeEventPayload(event) {
+  if (event == null) return 'null';
+  if (typeof event === 'string') return event;
+  try {
+    return JSON.stringify({
+      code: event.code,
+      reason: event.reason,
+      message: event.message,
+      type: event.type,
+      wasClean: event.wasClean,
+    });
+  } catch {
+    return safeErrorPayload(event);
+  }
+}
+
+/** Logs immediately before every session / WebSocket teardown (no secrets). */
+function logSessionClose(details) {
+  const {
+    initiator,
+    clientWsId,
+    liveSessionId,
+    clientWsCloseCode,
+    clientWsCloseReason,
+    geminiErrorPayload,
+    geminiClosePayload,
+    stackTrace,
+    flutterRequestedDisconnect,
+    geminiClosedSession,
+    proxyClosedClient,
+    proxyClosedGemini,
+  } = details;
+
+  console.log(
+    `${LOG_TAG_CLOSE} ts=${logTimestamp()} initiator=${initiator ?? 'unknown'} ` +
+      `clientWsId=${clientWsId ?? 'n/a'} liveSessionId=${liveSessionId ?? 'n/a'} ` +
+      `clientWsCloseCode=${clientWsCloseCode ?? 'n/a'} ` +
+      `clientWsCloseReason=${JSON.stringify(clientWsCloseReason ?? '')} ` +
+      `flutterRequestedDisconnect=${flutterRequestedDisconnect === true} ` +
+      `geminiClosedSession=${geminiClosedSession === true} ` +
+      `proxyClosedClient=${proxyClosedClient === true} ` +
+      `proxyClosedGemini=${proxyClosedGemini === true} ` +
+      `geminiErrorPayload=${geminiErrorPayload ?? 'n/a'} ` +
+      `geminiClosePayload=${geminiClosePayload ?? 'n/a'} ` +
+      `stackTrace=${JSON.stringify(stackTrace ?? '')}`,
+  );
+}
+
+function captureStackTrace() {
+  return new Error('SESSION_CLOSE_DIAG').stack ?? '';
+}
 
 function logVoiceFlow(event, { clientWsId, liveSessionId, extra = '' }) {
   const suffix = extra ? ` ${extra}` : '';
@@ -159,14 +231,70 @@ wss.on('connection', async (clientWs, session, token) => {
   const geminiMeta = () => ({ clientWsId, liveSessionId });
   let flutterAudioChunksIn = 0;
 
+  let flutterAudioChunksIn = 0;
+  let lastGeminiErrorPayload = 'none';
+  let proxyClosingClient = false;
+  let proxyClosingGemini = false;
+  let geminiSessionClosed = false;
+
   logProxyLifecycle('CLIENT_WS_CONNECT', { clientWsId, liveSessionId });
   logVoiceFlow('client_connected', { clientWsId, liveSessionId });
 
-  clientWs.on('close', () => {
+  clientWs.on('error', (err) => {
+    logSessionClose({
+      initiator: 'client_websocket_error',
+      clientWsId,
+      liveSessionId,
+      geminiErrorPayload: safeErrorPayload(err),
+      stackTrace: captureStackTrace(),
+      flutterRequestedDisconnect: false,
+      geminiClosedSession: geminiSessionClosed,
+      proxyClosedClient: proxyClosingClient,
+      proxyClosedGemini: proxyClosingGemini,
+    });
+  });
+
+  clientWs.on('close', (code, reasonBuffer) => {
+    const reason =
+      typeof reasonBuffer === 'string'
+        ? reasonBuffer
+        : reasonBuffer?.toString?.() ?? '';
+    const flutterRequested =
+      !proxyClosingClient && !proxyClosingGemini && !geminiSessionClosed;
+
+    logSessionClose({
+      initiator: 'client_websocket_close',
+      clientWsId,
+      liveSessionId,
+      clientWsCloseCode: code,
+      clientWsCloseReason: reason,
+      geminiErrorPayload: lastGeminiErrorPayload,
+      stackTrace: captureStackTrace(),
+      flutterRequestedDisconnect: flutterRequested,
+      geminiClosedSession: geminiSessionClosed,
+      proxyClosedClient: proxyClosingClient,
+      proxyClosedGemini: proxyClosingGemini,
+    });
+
     logProxyLifecycle('CLIENT_WS_DISCONNECT', { clientWsId, liveSessionId });
     try {
-      liveSession?.close();
-    } catch (_) {}
+      if (liveSession) {
+        proxyClosingGemini = true;
+        liveSession.close();
+      }
+    } catch (closeErr) {
+      logSessionClose({
+        initiator: 'proxy_liveSession_close_error',
+        clientWsId,
+        liveSessionId,
+        geminiErrorPayload: safeErrorPayload(closeErr),
+        stackTrace: captureStackTrace(),
+        flutterRequestedDisconnect: false,
+        geminiClosedSession: geminiSessionClosed,
+        proxyClosedClient: proxyClosingClient,
+        proxyClosedGemini: true,
+      });
+    }
     sessions.delete(token);
   });
 
@@ -285,9 +413,35 @@ wss.on('connection', async (clientWs, session, token) => {
           }
         },
         onerror: (e) => {
+          lastGeminiErrorPayload = safeErrorPayload(e);
+          logSessionClose({
+            initiator: 'gemini_live_onerror',
+            clientWsId,
+            liveSessionId,
+            geminiErrorPayload: lastGeminiErrorPayload,
+            stackTrace: captureStackTrace(),
+            flutterRequestedDisconnect: false,
+            geminiClosedSession: geminiSessionClosed,
+            proxyClosedClient: proxyClosingClient,
+            proxyClosedGemini: proxyClosingGemini,
+          });
           sendClient(clientWs, { type: 'error', message: e.message ?? String(e) });
         },
-        onclose: () => {
+        onclose: (event) => {
+          geminiSessionClosed = true;
+          const geminiClosePayload = safeEventPayload(event);
+          logSessionClose({
+            initiator: 'gemini_live_onclose',
+            clientWsId,
+            liveSessionId,
+            geminiClosePayload,
+            geminiErrorPayload: lastGeminiErrorPayload,
+            stackTrace: captureStackTrace(),
+            flutterRequestedDisconnect: false,
+            geminiClosedSession: true,
+            proxyClosedClient: proxyClosingClient,
+            proxyClosedGemini: proxyClosingGemini,
+          });
           logProxyLifecycle('GEMINI_LIVE_SESSION_CLOSE', {
             clientWsId,
             liveSessionId,
@@ -444,11 +598,35 @@ wss.on('connection', async (clientWs, session, token) => {
             break;
         }
       } catch (err) {
+        lastGeminiErrorPayload = safeErrorPayload(err);
+        logSessionClose({
+          initiator: 'client_message_handler_error',
+          clientWsId,
+          liveSessionId,
+          geminiErrorPayload: lastGeminiErrorPayload,
+          stackTrace: err?.stack ?? captureStackTrace(),
+          flutterRequestedDisconnect: false,
+          geminiClosedSession: geminiSessionClosed,
+          proxyClosedClient: proxyClosingClient,
+          proxyClosedGemini: proxyClosingGemini,
+        });
         sendClient(clientWs, { type: 'error', message: String(err) });
       }
     });
   } catch (err) {
+    logSessionClose({
+      initiator: 'proxy_connection_setup_error',
+      clientWsId,
+      liveSessionId,
+      geminiErrorPayload: safeErrorPayload(err),
+      stackTrace: err?.stack ?? captureStackTrace(),
+      flutterRequestedDisconnect: false,
+      geminiClosedSession: geminiSessionClosed,
+      proxyClosedClient: true,
+      proxyClosedGemini: proxyClosingGemini,
+    });
     sendClient(clientWs, { type: 'error', message: String(err) });
+    proxyClosingClient = true;
     clientWs.close();
   }
 });
