@@ -23,6 +23,44 @@ if (!API_KEY) {
 const ai = new GoogleGenAI({ apiKey: API_KEY });
 const sessions = new Map();
 
+/** Temporary: counts outbound calls to Gemini (connect, sendClientContent, sendRealtimeInput). */
+let geminiOutboundRequestCount = 0;
+
+const LOG_TAG_REQ = '[GEMINI_REQ_LOG]';
+const LOG_TAG_PROXY = '[GEMINI_PROXY_LOG]';
+
+function logTimestamp() {
+  return new Date().toISOString();
+}
+
+function newOpaqueId(prefix) {
+  return `${prefix}_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
+}
+
+function logGeminiOutbound(event, { clientWsId, liveSessionId }) {
+  geminiOutboundRequestCount += 1;
+  console.log(
+    `${LOG_TAG_REQ} #${geminiOutboundRequestCount} ts=${logTimestamp()} event=${event} endpoint=gemini.live model=${LIVE_MODEL} clientWsId=${clientWsId} liveSessionId=${liveSessionId ?? 'n/a'}`,
+  );
+}
+
+function logProxyLifecycle(event, { clientWsId, liveSessionId, extra = '' }) {
+  const suffix = extra ? ` ${extra}` : '';
+  console.log(
+    `${LOG_TAG_PROXY} ts=${logTimestamp()} event=${event} clientWsId=${clientWsId} liveSessionId=${liveSessionId ?? 'n/a'}${suffix}`,
+  );
+}
+
+async function geminiSendClientContent(liveSession, payload, meta) {
+  logGeminiOutbound('gemini.live.sendClientContent', meta);
+  return liveSession.sendClientContent(payload);
+}
+
+async function geminiSendRealtimeInput(liveSession, payload, meta, eventSuffix) {
+  logGeminiOutbound(`gemini.live.sendRealtimeInput.${eventSuffix}`, meta);
+  return liveSession.sendRealtimeInput(payload);
+}
+
 const app = express();
 app.use(express.json({ limit: '12mb' }));
 
@@ -99,11 +137,26 @@ wss.on('connection', async (clientWs, session, token) => {
   let modelSpeaking = false;
   let paused = false;
 
+  const clientWsId = newOpaqueId('cws');
+  const liveSessionId = newOpaqueId('gls');
+  const geminiMeta = () => ({ clientWsId, liveSessionId });
+
+  logProxyLifecycle('CLIENT_WS_CONNECT', { clientWsId, liveSessionId });
+
+  clientWs.on('close', () => {
+    logProxyLifecycle('CLIENT_WS_DISCONNECT', { clientWsId, liveSessionId });
+    try {
+      liveSession?.close();
+    } catch (_) {}
+    sessions.delete(token);
+  });
+
   const pushState = (state) => sendClient(clientWs, { type: 'state', state });
 
   try {
     pushState('Bağlanıyor');
 
+    logGeminiOutbound('gemini.live.connect', geminiMeta());
     liveSession = await ai.live.connect({
       model: LIVE_MODEL,
       config: {
@@ -119,6 +172,10 @@ wss.on('connection', async (clientWs, session, token) => {
       },
       callbacks: {
         onopen: () => {
+          logProxyLifecycle('GEMINI_LIVE_SESSION_START', {
+            clientWsId,
+            liveSessionId,
+          });
           pushState('Düşünüyor');
         },
         onmessage: (message) => {
@@ -197,6 +254,10 @@ wss.on('connection', async (clientWs, session, token) => {
           sendClient(clientWs, { type: 'error', message: e.message ?? String(e) });
         },
         onclose: () => {
+          logProxyLifecycle('GEMINI_LIVE_SESSION_CLOSE', {
+            clientWsId,
+            liveSessionId,
+          });
           sendClient(clientWs, { type: 'closed' });
         },
       },
@@ -204,47 +265,59 @@ wss.on('connection', async (clientWs, session, token) => {
 
     // Image once at session start, then written context, then voice kickoff prompt.
     if (session.config.imageBase64) {
-      await liveSession.sendClientContent({
-        turns: [
-          {
-            role: 'user',
-            parts: [
-              {
-                inlineData: {
-                  mimeType: session.config.imageMimeType,
-                  data: session.config.imageBase64,
+      await geminiSendClientContent(
+        liveSession,
+        {
+          turns: [
+            {
+              role: 'user',
+              parts: [
+                {
+                  inlineData: {
+                    mimeType: session.config.imageMimeType,
+                    data: session.config.imageBase64,
+                  },
                 },
-              },
-            ],
-          },
-        ],
-        turnComplete: true,
-      });
+              ],
+            },
+          ],
+          turnComplete: true,
+        },
+        geminiMeta(),
+      );
     }
 
     for (const line of session.config.priorTranscript ?? []) {
       if (!line?.text) continue;
-      await liveSession.sendClientContent({
-        turns: [
-          {
-            role: line.role === 'user' ? 'user' : 'model',
-            parts: [{ text: line.text }],
-          },
-        ],
-        turnComplete: true,
-      });
+      await geminiSendClientContent(
+        liveSession,
+        {
+          turns: [
+            {
+              role: line.role === 'user' ? 'user' : 'model',
+              parts: [{ text: line.text }],
+            },
+          ],
+          turnComplete: true,
+        },
+        geminiMeta(),
+      );
     }
 
     if (session.config.initialAnalysisText?.trim()) {
-      await liveSession.sendClientContent({
-        turns: [
-          {
-            role: 'user',
-            parts: [{ text: session.config.initialAnalysisText.trim() }],
-          },
-        ],
-        turnComplete: true,
-      });
+      await geminiSendClientContent(
+        liveSession,
+        {
+          turns: [
+            {
+              role: 'user',
+              parts: [{ text: session.config.initialAnalysisText.trim() }],
+            },
+          ],
+          turnComplete: true,
+        },
+        geminiMeta(),
+      );
     }
 
     pushState('Dinliyorum');
@@ -255,23 +328,37 @@ wss.on('connection', async (clientWs, session, token) => {
         switch (msg.type) {
           case 'audio':
             if (paused) break;
-            await liveSession.sendRealtimeInput({
-              audio: {
-                data: msg.data,
-                mimeType: msg.mimeType || 'audio/pcm;rate=16000',
+            await geminiSendRealtimeInput(
+              liveSession,
+              {
+                audio: {
+                  data: msg.data,
+                  mimeType: msg.mimeType || 'audio/pcm;rate=16000',
+                },
               },
-            });
+              geminiMeta(),
+              'audio',
+            );
             if (!modelSpeaking) pushState('Dinliyorum');
             break;
           case 'text':
-            await liveSession.sendClientContent({
-              turns: [{ role: 'user', parts: [{ text: msg.text }] }],
-              turnComplete: true,
-            });
+            await geminiSendClientContent(
+              liveSession,
+              {
+                turns: [{ role: 'user', parts: [{ text: msg.text }] }],
+                turnComplete: true,
+              },
+              geminiMeta(),
+            );
             pushState('Düşünüyor');
             break;
           case 'interrupt':
-            await liveSession.sendRealtimeInput({ audioStreamEnd: true });
+            await geminiSendRealtimeInput(
+              liveSession,
+              { audioStreamEnd: true },
+              geminiMeta(),
+              'audioStreamEnd',
+            );
             modelSpeaking = false;
             pushState('Dinliyorum');
             break;
@@ -301,13 +388,6 @@ wss.on('connection', async (clientWs, session, token) => {
       } catch (err) {
         sendClient(clientWs, { type: 'error', message: String(err) });
       }
-    });
-
-    clientWs.on('close', () => {
-      try {
-        liveSession?.close();
-      } catch (_) {}
-      sessions.delete(token);
     });
   } catch (err) {
     sendClient(clientWs, { type: 'error', message: String(err) });
