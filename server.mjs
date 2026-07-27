@@ -326,6 +326,28 @@ wss.on('connection', async (clientWs, session, token) => {
   let proxyClosingClient = false;
   let proxyClosingGemini = false;
   let geminiSessionClosed = false;
+  let micReadySent = false;
+  let micReadyFallbackTimer = null;
+
+  const sendMicReadyOnce = () => {
+    if (micReadySent) return;
+    micReadySent = true;
+    if (micReadyFallbackTimer) {
+      clearTimeout(micReadyFallbackTimer);
+      micReadyFallbackTimer = null;
+    }
+    sendClient(clientWs, { type: 'micReady' });
+    pushState('Dinliyorum');
+    logVoiceFlow('mic_ready_sent_to_flutter', { clientWsId, liveSessionId });
+  };
+
+  const scheduleMicReadyFallback = () => {
+    if (micReadyFallbackTimer || micReadySent) return;
+    micReadyFallbackTimer = setTimeout(() => {
+      micReadyFallbackTimer = null;
+      sendMicReadyOnce();
+    }, 15000);
+  };
 
   logProxyLifecycle('CLIENT_WS_CONNECT', { clientWsId, liveSessionId });
   logVoiceFlow('client_connected', { clientWsId, liveSessionId });
@@ -494,6 +516,7 @@ wss.on('connection', async (clientWs, session, token) => {
             }
             modelSpeaking = false;
             pushState('Dinliyorum');
+            sendMicReadyOnce();
           }
         },
         onerror: (e) => {
@@ -593,7 +616,7 @@ wss.on('connection', async (clientWs, session, token) => {
       );
     }
 
-    pushState('Dinliyorum');
+    scheduleMicReadyFallback();
 
     clientWs.on('message', async (raw) => {
       try {
