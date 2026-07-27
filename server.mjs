@@ -58,7 +58,7 @@ function safeEventPayload(event) {
       code: event.code,
       reason: event.reason,
       message: event.message,
-      type: event.type,
+      wsEventType: event.type,
       wasClean: event.wasClean,
     });
   } catch {
@@ -148,6 +148,98 @@ async function geminiSendClientContent(liveSession, payload, meta) {
 async function geminiSendRealtimeInput(liveSession, payload, meta, eventSuffix) {
   logGeminiOutbound(`gemini.live.sendRealtimeInput.${eventSuffix}`, meta);
   return liveSession.sendRealtimeInput(payload);
+}
+
+/** Blocks deprecated Bidi client payloads (e.g. {"type":"close"}) on the Gemini wire. */
+function guardGeminiLiveTransport(liveSession, meta) {
+  const conn = liveSession?.conn;
+  if (!conn || typeof conn.send !== 'function' || conn.__ayvaraSendGuarded) {
+    return;
+  }
+  const originalSend = conn.send.bind(conn);
+  conn.send = (message) => {
+    if (typeof message === 'string') {
+      try {
+        const parsed = JSON.parse(message);
+        if (parsed?.type === 'close' || parsed?.close != null) {
+          logProxyLifecycle('BLOCKED_LEGACY_GEMINI_CLOSE_PAYLOAD', {
+            ...meta,
+            extra: 'type=close',
+          });
+          return;
+        }
+      } catch {
+        // Non-JSON frames are passed through unchanged.
+      }
+    }
+    return originalSend(message);
+  };
+  conn.__ayvaraSendGuarded = true;
+}
+
+/**
+ * Official Live API teardown: optional audioStreamEnd, then WebSocket close only.
+ * Never sends legacy {"type":"close"} (or similar) JSON to Gemini.
+ */
+async function shutdownGeminiLiveSession(
+  liveSession,
+  meta,
+  { signalAudioStreamEnd = false } = {},
+) {
+  if (!liveSession) return;
+  if (signalAudioStreamEnd) {
+    try {
+      await geminiSendRealtimeInput(
+        liveSession,
+        { audioStreamEnd: true },
+        meta,
+        'audioStreamEnd',
+      );
+    } catch (err) {
+      logSessionClose({
+        initiator: 'shutdown_audio_stream_end_error',
+        ...meta,
+        geminiErrorPayload: safeErrorPayload(err),
+        stackTrace: captureStackTrace(),
+        flutterRequestedDisconnect: false,
+        geminiClosedSession: false,
+        proxyClosedClient: false,
+        proxyClosedGemini: true,
+      });
+    }
+  }
+  try {
+    liveSession.conn?.close?.();
+  } catch (err) {
+    logSessionClose({
+      initiator: 'shutdown_websocket_close_error',
+      ...meta,
+      geminiErrorPayload: safeErrorPayload(err),
+      stackTrace: captureStackTrace(),
+      flutterRequestedDisconnect: false,
+      geminiClosedSession: false,
+      proxyClosedClient: false,
+      proxyClosedGemini: true,
+    });
+  }
+}
+
+function buildLiveConnectConfig(session) {
+  const config = {
+    responseModalities: [Modality.AUDIO],
+    inputAudioTranscription: {},
+    outputAudioTranscription: {},
+    systemInstruction: {
+      parts: [{ text: session.config.systemInstruction }],
+    },
+  };
+  // Native-audio Live models reject legacy prebuilt TTS voice config.
+  if (!LIVE_MODEL.includes('native-audio')) {
+    config.speechConfig = {
+      voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
+    };
+  }
+  return config;
 }
 
 const app = express();
@@ -252,7 +344,7 @@ wss.on('connection', async (clientWs, session, token) => {
     });
   });
 
-  clientWs.on('close', (code, reasonBuffer) => {
+  clientWs.on('close', async (code, reasonBuffer) => {
     const reason =
       typeof reasonBuffer === 'string'
         ? reasonBuffer
@@ -278,7 +370,11 @@ wss.on('connection', async (clientWs, session, token) => {
     try {
       if (liveSession) {
         proxyClosingGemini = true;
-        liveSession.close();
+        await shutdownGeminiLiveSession(liveSession, {
+          clientWsId,
+          liveSessionId,
+        });
+        liveSession = null;
       }
     } catch (closeErr) {
       logSessionClose({
@@ -304,17 +400,7 @@ wss.on('connection', async (clientWs, session, token) => {
     logGeminiOutbound('gemini.live.connect', geminiMeta());
     liveSession = await ai.live.connect({
       model: LIVE_MODEL,
-      config: {
-        responseModalities: [Modality.AUDIO],
-        inputAudioTranscription: {},
-        outputAudioTranscription: {},
-        speechConfig: {
-          voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
-        },
-        systemInstruction: {
-          parts: [{ text: session.config.systemInstruction }],
-        },
-      },
+      config: buildLiveConnectConfig(session),
       callbacks: {
         onopen: () => {
           logProxyLifecycle('GEMINI_LIVE_SESSION_START', {
@@ -448,6 +534,7 @@ wss.on('connection', async (clientWs, session, token) => {
         },
       },
     });
+    guardGeminiLiveTransport(liveSession, geminiMeta());
 
     // Image once at session start, then written context, then voice kickoff prompt.
     if (session.config.imageBase64) {
@@ -600,6 +687,15 @@ wss.on('connection', async (clientWs, session, token) => {
             session.reconnectUsed = true;
             sendClient(clientWs, { type: 'reconnected' });
             pushState('Dinliyorum');
+            break;
+          case 'close':
+          case 'disconnect':
+            proxyClosingGemini = true;
+            await shutdownGeminiLiveSession(liveSession, geminiMeta(), {
+              signalAudioStreamEnd: true,
+            });
+            liveSession = null;
+            sendClient(clientWs, { type: 'closed' });
             break;
           default:
             break;
