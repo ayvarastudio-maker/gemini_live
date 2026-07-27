@@ -178,6 +178,33 @@ function summarizeModelTurnParts(parts) {
   return summary;
 }
 
+function summarizeGeminiServerMessage(message) {
+  const sc = message?.serverContent;
+  return {
+    setupComplete: message?.setupComplete != null,
+    serverContent: sc
+      ? {
+          turnComplete: sc.turnComplete ?? null,
+          generationComplete: sc.generationComplete ?? null,
+          interrupted: sc.interrupted ?? null,
+          waitingForInput: sc.waitingForInput ?? null,
+          turnCompleteReason: sc.turnCompleteReason ?? null,
+          inputTranscription: sc.inputTranscription?.text
+            ? {
+                chars: sc.inputTranscription.text.length,
+                finished: sc.inputTranscription.finished ?? null,
+              }
+            : null,
+          modelTurn: sc.modelTurn?.parts
+            ? summarizeModelTurnParts(sc.modelTurn.parts)
+            : null,
+        }
+      : null,
+    voiceActivity: message?.voiceActivity?.voiceActivityType ?? null,
+    vadSignal: message?.voiceActivityDetectionSignal?.vadSignalType ?? null,
+  };
+}
+
 function newOpaqueId(prefix) {
   return `${prefix}_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
 }
@@ -206,8 +233,8 @@ async function geminiSendRealtimeInput(liveSession, payload, meta, eventSuffix) 
   return liveSession.sendRealtimeInput(payload);
 }
 
-/** Blocks deprecated Bidi client payloads (e.g. {"type":"close"}) on the Gemini wire. */
-function guardGeminiLiveTransport(liveSession, meta) {
+/** Blocks deprecated Bidi client payloads; logs Gemini wire after audioStreamEnd. */
+function guardGeminiLiveTransport(liveSession, meta, turnWatch) {
   const conn = liveSession?.conn;
   if (!conn || typeof conn.send !== 'function' || conn.__ayvaraSendGuarded) {
     return;
@@ -225,6 +252,30 @@ function guardGeminiLiveTransport(liveSession, meta) {
               `clientWsId=${meta.clientWsId} liveSessionId=${meta.liveSessionId} ` +
               `payload=${JSON.stringify(redactLiveWireJson(parsed))}`,
           );
+        }
+        if (turnWatch?.logOutboundAfterStreamEnd) {
+          const keys = Object.keys(parsed).filter((k) => parsed[k] != null);
+          logSpeechDiag('gemini_wire_outbound_after_audioStreamEnd', meta, {
+            keys,
+            hasClientContent: parsed.clientContent != null,
+            clientTurnComplete: parsed.clientContent?.turnComplete ?? null,
+            hasRealtimeInput: parsed.realtimeInput != null,
+            realtimeAudioStreamEnd:
+              parsed.realtimeInput?.audioStreamEnd ?? null,
+            hasActivityStart: parsed.realtimeInput?.activityStart != null,
+            hasActivityEnd: parsed.realtimeInput?.activityEnd != null,
+          });
+        }
+        if (
+          turnWatch?.streamEndForwarded &&
+          parsed.clientContent?.turnComplete === true
+        ) {
+          logSpeechDiag(
+            'BLOCKED_clientContent_turnComplete_after_audioStreamEnd',
+            meta,
+            {},
+          );
+          return;
         }
         if (parsed?.type === 'close' || parsed?.close != null) {
           logProxyLifecycle('BLOCKED_LEGACY_GEMINI_CLOSE_PAYLOAD', {
@@ -524,6 +575,11 @@ wss.on('connection', async (clientWs, session, token) => {
   let firstFlutterAudioLogged = false;
   let firstAudioForwardedLogged = false;
   let setupCompleteHandled = false;
+  const turnWatch = {
+    streamEndForwarded: false,
+    logOutboundAfterStreamEnd: false,
+    automaticActivityDetectionEnabled: true,
+  };
 
   const onGeminiSetupComplete = () => {
     if (setupCompleteHandled) return;
@@ -707,14 +763,44 @@ wss.on('connection', async (clientWs, session, token) => {
         case 'audioStreamEnd':
           if (!geminiSetupComplete) break;
           logSpeechDiag('flutter_audio_stream_end_received', geminiMeta(), {});
+          logSpeechDiag('automatic_activity_detection', geminiMeta(), {
+            enabled: turnWatch.automaticActivityDetectionEnabled,
+            source:
+              'default_live_api_no_realtimeInputConfig_in_setup_audioStreamEnd_used',
+          });
           await geminiSendRealtimeInput(
             liveSession,
             { audioStreamEnd: true },
             geminiMeta(),
             'audioStreamEnd',
           );
-          logSpeechDiag('gemini_audio_stream_end_forwarded', geminiMeta(), {});
-          pushState('Dinliyorum');
+          turnWatch.streamEndForwarded = true;
+          turnWatch.logOutboundAfterStreamEnd = true;
+          logSpeechDiag('gemini_audio_stream_end_forwarded', geminiMeta(), {
+            note: 'realtimeInput.audioStreamEnd only; no clientContent.turnComplete',
+          });
+          pushState('Düşünüyor');
+          break;
+        case 'activityStart':
+          if (!geminiSetupComplete) break;
+          await geminiSendRealtimeInput(
+            liveSession,
+            { activityStart: {} },
+            geminiMeta(),
+            'activityStart',
+          );
+          break;
+        case 'activityEnd':
+          if (!geminiSetupComplete) break;
+          await geminiSendRealtimeInput(
+            liveSession,
+            { activityEnd: {} },
+            geminiMeta(),
+            'activityEnd',
+          );
+          turnWatch.streamEndForwarded = true;
+          turnWatch.logOutboundAfterStreamEnd = true;
+          pushState('Düşünüyor');
           break;
         case 'interrupt':
           if (!geminiSetupComplete) break;
@@ -830,7 +916,20 @@ wss.on('connection', async (clientWs, session, token) => {
           if (message.setupComplete && !geminiSetupComplete) {
             geminiSetupComplete = true;
             logSetupComplete(geminiMeta());
+            logSpeechDiag('automatic_activity_detection', geminiMeta(), {
+              enabled: turnWatch.automaticActivityDetectionEnabled,
+              source:
+                'setup_has_no_realtimeInputConfig_automaticActivityDetection_defaults_enabled',
+            });
             onGeminiSetupComplete();
+          }
+
+          if (turnWatch.logOutboundAfterStreamEnd) {
+            logSpeechDiag(
+              'gemini_server_message_after_audioStreamEnd',
+              geminiMeta(),
+              summarizeGeminiServerMessage(message),
+            );
           }
 
           if (message.serverContent?.interrupted) {
@@ -882,7 +981,15 @@ wss.on('connection', async (clientWs, session, token) => {
             }
           }
 
+          if (message.serverContent?.generationComplete) {
+            logSpeechDiag('gemini_generation_complete', geminiMeta(), {
+              afterAudioStreamEnd: turnWatch.logOutboundAfterStreamEnd,
+            });
+          }
+
           if (message.serverContent?.turnComplete) {
+            turnWatch.streamEndForwarded = false;
+            turnWatch.logOutboundAfterStreamEnd = false;
             logGeminiTurnComplete(geminiMeta(), {
               generationComplete:
                 message.serverContent.generationComplete ?? null,
@@ -899,6 +1006,7 @@ wss.on('connection', async (clientWs, session, token) => {
                 message.serverContent.turnCompleteReason ?? null,
               interrupted: message.serverContent.interrupted ?? null,
             });
+            sendClient(clientWs, { type: 'turnComplete' });
             userTranscriptBuffer = '';
             modelTranscriptBuffer = '';
             modelSpeaking = false;
@@ -910,6 +1018,7 @@ wss.on('connection', async (clientWs, session, token) => {
           lastGeminiErrorPayload = safeErrorPayload(e);
           logSpeechDiag('gemini_error', geminiMeta(), {
             payload: lastGeminiErrorPayload,
+            afterAudioStreamEnd: turnWatch.logOutboundAfterStreamEnd,
           });
           logSessionClose({
             initiator: 'gemini_live_onerror',
@@ -929,6 +1038,9 @@ wss.on('connection', async (clientWs, session, token) => {
           const geminiClosePayload = safeEventPayload(event);
           logSpeechDiag('gemini_close', geminiMeta(), {
             payload: geminiClosePayload,
+            closeCode: event?.code ?? null,
+            closeReason: event?.reason ?? null,
+            afterAudioStreamEnd: turnWatch.logOutboundAfterStreamEnd,
           });
           logSessionClose({
             initiator: 'gemini_live_onclose',
@@ -950,7 +1062,7 @@ wss.on('connection', async (clientWs, session, token) => {
         },
       },
     });
-    guardGeminiLiveTransport(liveSession, geminiMeta());
+    guardGeminiLiveTransport(liveSession, geminiMeta(), turnWatch);
   } catch (err) {
     logSessionClose({
       initiator: 'proxy_connection_setup_error',
