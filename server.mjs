@@ -29,6 +29,7 @@ let geminiOutboundRequestCount = 0;
 const LOG_TAG_REQ = '[GEMINI_REQ_LOG]';
 const LOG_TAG_PROXY = '[GEMINI_PROXY_LOG]';
 const LOG_TAG_VOICE = '[VOICE_FLOW_LOG]';
+const LOG_TAG_SPEECH_DIAG = '[GEMINI_SPEECH_DIAG]';
 const LOG_TAG_SETUP = '[GEMINI_SETUP_LOG]';
 const EXPECTED_INPUT_MIME = 'audio/pcm;rate=16000';
 
@@ -121,6 +122,35 @@ function audioByteLengthBase64(b64) {
 
 function logTimestamp() {
   return new Date().toISOString();
+}
+
+function logSpeechDiag(event, meta, fields = {}) {
+  const extras = Object.entries(fields)
+    .map(([key, value]) => `${key}=${JSON.stringify(value)}`)
+    .join(' ');
+  console.log(
+    `${LOG_TAG_SPEECH_DIAG} ts=${logTimestamp()} event=${event} ` +
+      `clientWsId=${meta.clientWsId} liveSessionId=${meta.liveSessionId}` +
+      (extras ? ` ${extras}` : ''),
+  );
+}
+
+function summarizeModelTurnParts(parts) {
+  const summary = [];
+  for (const part of parts ?? []) {
+    if (part.inlineData?.data) {
+      summary.push({
+        kind: 'audio',
+        bytes: audioByteLengthBase64(part.inlineData.data),
+        mimeType: part.inlineData.mimeType || 'audio/pcm',
+      });
+    } else if (part.text) {
+      summary.push({ kind: 'text', chars: part.text.length });
+    } else {
+      summary.push({ kind: 'other' });
+    }
+  }
+  return summary;
 }
 
 function newOpaqueId(prefix) {
@@ -600,6 +630,9 @@ wss.on('connection', async (clientWs, session, token) => {
         case 'audio':
           if (paused || !liveSession) break;
           if (!geminiSetupComplete) {
+            logSpeechDiag('flutter_audio_chunk_dropped', geminiMeta(), {
+              reason: 'setupComplete_pending',
+            });
             logVoiceFlow('audio_chunk_dropped_before_setupComplete', {
               clientWsId,
               liveSessionId,
@@ -610,6 +643,14 @@ wss.on('connection', async (clientWs, session, token) => {
           {
             const mimeType = EXPECTED_INPUT_MIME;
             const pcmBytes = validateIncomingPcm16Base64(msg.data, mimeType);
+            const shouldLogChunk =
+              flutterAudioChunksIn <= 10 || flutterAudioChunksIn % 25 === 0;
+            if (shouldLogChunk) {
+              logSpeechDiag('flutter_audio_chunk_received', geminiMeta(), {
+                chunkIndex: flutterAudioChunksIn,
+                pcmBytes,
+              });
+            }
             if (!firstGeminiAudioForwarded) {
               logFirstAudioAfterSetupComplete(geminiMeta(), pcmBytes);
               firstGeminiAudioForwarded = true;
@@ -635,14 +676,10 @@ wss.on('connection', async (clientWs, session, token) => {
               geminiMeta(),
               'audio',
             );
-            if (
-              flutterAudioChunksIn === 1 ||
-              flutterAudioChunksIn % 50 === 0
-            ) {
-              logVoiceFlow('audio_chunk_sent_to_gemini', {
-                clientWsId,
-                liveSessionId,
-                extra: `chunkIndex=${flutterAudioChunksIn}`,
+            if (shouldLogChunk) {
+              logSpeechDiag('gemini_audio_chunk_forwarded', geminiMeta(), {
+                chunkIndex: flutterAudioChunksIn,
+                pcmBytes,
               });
             }
           }
@@ -662,12 +699,14 @@ wss.on('connection', async (clientWs, session, token) => {
           break;
         case 'audioStreamEnd':
           if (!geminiSetupComplete) break;
+          logSpeechDiag('flutter_audio_stream_end_received', geminiMeta(), {});
           await geminiSendRealtimeInput(
             liveSession,
             { audioStreamEnd: true },
             geminiMeta(),
             'audioStreamEnd',
           );
+          logSpeechDiag('gemini_audio_stream_end_forwarded', geminiMeta(), {});
           pushState('Dinliyorum');
           break;
         case 'interrupt':
@@ -751,6 +790,36 @@ wss.on('connection', async (clientWs, session, token) => {
           pushState('Düşünüyor');
         },
         onmessage: (message) => {
+          if (message.voiceActivity?.voiceActivityType) {
+            const activityType = message.voiceActivity.voiceActivityType;
+            if (
+              activityType === 'ACTIVITY_START' ||
+              String(activityType).includes('START')
+            ) {
+              logSpeechDiag('gemini_speech_start', geminiMeta(), {
+                voiceActivityType: activityType,
+                activityStart: true,
+              });
+            } else if (
+              activityType === 'ACTIVITY_END' ||
+              String(activityType).includes('END')
+            ) {
+              logSpeechDiag('gemini_speech_end', geminiMeta(), {
+                voiceActivityType: activityType,
+                activityEnd: true,
+              });
+            } else {
+              logSpeechDiag('gemini_voice_activity', geminiMeta(), {
+                voiceActivityType: activityType,
+              });
+            }
+          }
+          if (message.voiceActivityDetectionSignal?.vadSignalType) {
+            logSpeechDiag('gemini_vad_signal', geminiMeta(), {
+              vadSignalType: message.voiceActivityDetectionSignal.vadSignalType,
+            });
+          }
+
           if (message.setupComplete && !geminiSetupComplete) {
             geminiSetupComplete = true;
             logSetupComplete(geminiMeta());
@@ -770,7 +839,14 @@ wss.on('connection', async (clientWs, session, token) => {
           }
 
           if (message.serverContent?.inputTranscription?.text) {
-            userTranscriptBuffer += message.serverContent.inputTranscription.text;
+            const inputText = message.serverContent.inputTranscription.text;
+            logSpeechDiag('gemini_input_transcription', geminiMeta(), {
+              chars: inputText.length,
+              snippet: inputText.slice(0, 120),
+              finished:
+                message.serverContent.inputTranscription.finished ?? null,
+            });
+            userTranscriptBuffer += inputText;
             sendClient(clientWs, {
               type: 'transcript',
               role: 'user',
@@ -790,6 +866,11 @@ wss.on('connection', async (clientWs, session, token) => {
           }
 
           const parts = message.serverContent?.modelTurn?.parts ?? [];
+          if (parts.length > 0) {
+            logSpeechDiag('gemini_model_turn', geminiMeta(), {
+              parts: summarizeModelTurnParts(parts),
+            });
+          }
           for (const part of parts) {
             if (part.inlineData?.data) {
               modelSpeaking = true;
@@ -823,6 +904,14 @@ wss.on('connection', async (clientWs, session, token) => {
           }
 
           if (message.serverContent?.turnComplete) {
+            logSpeechDiag('gemini_turn_complete', geminiMeta(), {
+              generationComplete:
+                message.serverContent.generationComplete ?? null,
+              waitingForInput: message.serverContent.waitingForInput ?? null,
+              turnCompleteReason:
+                message.serverContent.turnCompleteReason ?? null,
+              interrupted: message.serverContent.interrupted ?? null,
+            });
             if (userTranscriptBuffer.trim()) {
               sendClient(clientWs, {
                 type: 'transcript',
@@ -848,6 +937,9 @@ wss.on('connection', async (clientWs, session, token) => {
         },
         onerror: (e) => {
           lastGeminiErrorPayload = safeErrorPayload(e);
+          logSpeechDiag('gemini_error', geminiMeta(), {
+            payload: lastGeminiErrorPayload,
+          });
           logSessionClose({
             initiator: 'gemini_live_onerror',
             clientWsId,
@@ -864,6 +956,9 @@ wss.on('connection', async (clientWs, session, token) => {
         onclose: (event) => {
           geminiSessionClosed = true;
           const geminiClosePayload = safeEventPayload(event);
+          logSpeechDiag('gemini_close', geminiMeta(), {
+            payload: geminiClosePayload,
+          });
           logSessionClose({
             initiator: 'gemini_live_onclose',
             clientWsId,
