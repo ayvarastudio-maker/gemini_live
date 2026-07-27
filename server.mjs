@@ -112,6 +112,30 @@ function logVoiceFlow(event, { clientWsId, liveSessionId, extra = '' }) {
   );
 }
 
+function logGeminiAudioReceived(meta, mimeType, pcmBytes) {
+  logVoiceFlow('GEMINI_AUDIO_RECEIVED', {
+    ...meta,
+    extra: `mimeType=${mimeType} pcmBytes=${pcmBytes}`,
+  });
+}
+
+function logGeminiAudioForwarded(meta, mimeType, pcmBytes) {
+  logVoiceFlow('GEMINI_AUDIO_FORWARDED', {
+    ...meta,
+    extra: `mimeType=${mimeType} pcmBytes=${pcmBytes}`,
+  });
+}
+
+function logGeminiTurnComplete(meta, fields = {}) {
+  const extras = Object.entries(fields)
+    .map(([key, value]) => `${key}=${JSON.stringify(value)}`)
+    .join(' ');
+  logVoiceFlow('GEMINI_TURN_COMPLETE', {
+    ...meta,
+    extra: extras,
+  });
+}
+
 function audioByteLengthBase64(b64) {
   if (!b64 || typeof b64 !== 'string') return 0;
   try {
@@ -270,10 +294,20 @@ function modelResourceName() {
   return `models/${bare}`;
 }
 
-/** Minimum Live setup — matches official BidiGenerateContentSetup (no optional fields). */
+const LIVE_TURKISH_SYSTEM_INSTRUCTION = {
+  parts: [
+    {
+      text:
+        'Sen Türkçe konuşan bir kişisel stil danışmanısın. Kullanıcı hangi dilde konuşursa konuşsun, bütün cevaplarını yalnızca Türkçe ve sesli olarak ver. Kısa, doğal ve anlaşılır konuş.',
+    },
+  ],
+};
+
+/** Minimum Live setup — AUDIO output + Turkish system instruction (no transcription). */
 function buildMinimalLiveConnectConfig() {
   return {
     responseModalities: [Modality.AUDIO],
+    systemInstruction: LIVE_TURKISH_SYSTEM_INSTRUCTION,
   };
 }
 
@@ -284,6 +318,7 @@ function minimalSetupPayloadForLog() {
       generationConfig: {
         responseModalities: ['AUDIO'],
       },
+      systemInstruction: LIVE_TURKISH_SYSTEM_INSTRUCTION,
     },
   };
 }
@@ -813,22 +848,11 @@ wss.on('connection', async (clientWs, session, token) => {
                 message.serverContent.inputTranscription.finished ?? null,
             });
             userTranscriptBuffer += inputText;
-            sendClient(clientWs, {
-              type: 'transcript',
-              role: 'user',
-              text: userTranscriptBuffer,
-              final: false,
-            });
           }
 
           if (message.serverContent?.outputTranscription?.text) {
-            modelTranscriptBuffer += message.serverContent.outputTranscription.text;
-            sendClient(clientWs, {
-              type: 'transcript',
-              role: 'model',
-              text: modelTranscriptBuffer,
-              final: false,
-            });
+            modelTranscriptBuffer +=
+              message.serverContent.outputTranscription.text;
           }
 
           const parts = message.serverContent?.modelTurn?.parts ?? [];
@@ -841,35 +865,32 @@ wss.on('connection', async (clientWs, session, token) => {
             if (part.inlineData?.data) {
               modelSpeaking = true;
               pushState('Konuşuyor');
+              const mimeType = part.inlineData.mimeType || 'audio/pcm';
               const outBytes = audioByteLengthBase64(part.inlineData.data);
-              logVoiceFlow('gemini_audio_response_received', {
-                clientWsId,
-                liveSessionId,
-                extra: `bytes=${outBytes}`,
-              });
+              logGeminiAudioReceived(geminiMeta(), mimeType, outBytes);
               sendClient(clientWs, {
                 type: 'audio',
-                mimeType: part.inlineData.mimeType || 'audio/pcm',
+                mimeType,
                 data: part.inlineData.data,
               });
-              logVoiceFlow('audio_response_sent_to_flutter', {
-                clientWsId,
-                liveSessionId,
-                extra: `bytes=${outBytes}`,
-              });
-            }
-            if (part.text) {
-              modelTranscriptBuffer += part.text;
-              sendClient(clientWs, {
-                type: 'transcript',
-                role: 'model',
-                text: modelTranscriptBuffer,
-                final: false,
+              logGeminiAudioForwarded(geminiMeta(), mimeType, outBytes);
+            } else if (part.text?.trim()) {
+              logSpeechDiag('gemini_model_text_suppressed', geminiMeta(), {
+                chars: part.text.length,
+                reason: 'audio_response_mode',
               });
             }
           }
 
           if (message.serverContent?.turnComplete) {
+            logGeminiTurnComplete(geminiMeta(), {
+              generationComplete:
+                message.serverContent.generationComplete ?? null,
+              waitingForInput: message.serverContent.waitingForInput ?? null,
+              turnCompleteReason:
+                message.serverContent.turnCompleteReason ?? null,
+              interrupted: message.serverContent.interrupted ?? null,
+            });
             logSpeechDiag('gemini_turn_complete', geminiMeta(), {
               generationComplete:
                 message.serverContent.generationComplete ?? null,
@@ -878,24 +899,8 @@ wss.on('connection', async (clientWs, session, token) => {
                 message.serverContent.turnCompleteReason ?? null,
               interrupted: message.serverContent.interrupted ?? null,
             });
-            if (userTranscriptBuffer.trim()) {
-              sendClient(clientWs, {
-                type: 'transcript',
-                role: 'user',
-                text: userTranscriptBuffer.trim(),
-                final: true,
-              });
-              userTranscriptBuffer = '';
-            }
-            if (modelTranscriptBuffer.trim()) {
-              sendClient(clientWs, {
-                type: 'transcript',
-                role: 'model',
-                text: modelTranscriptBuffer.trim(),
-                final: true,
-              });
-              modelTranscriptBuffer = '';
-            }
+            userTranscriptBuffer = '';
+            modelTranscriptBuffer = '';
             modelSpeaking = false;
             pushState('Dinliyorum');
             sendMicReadyOnce();
