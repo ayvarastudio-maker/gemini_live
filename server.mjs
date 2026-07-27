@@ -562,6 +562,15 @@ wss.on('connection', async (clientWs, session, token) => {
             );
             pushState('Düşünüyor');
             break;
+          case 'audioStreamEnd':
+            await geminiSendRealtimeInput(
+              liveSession,
+              { audioStreamEnd: true },
+              geminiMeta(),
+              'audioStreamEnd',
+            );
+            pushState('Dinliyorum');
+            break;
           case 'interrupt':
             await geminiSendRealtimeInput(
               liveSession,
