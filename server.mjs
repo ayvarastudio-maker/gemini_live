@@ -230,8 +230,6 @@ wss.on('connection', async (clientWs, session, token) => {
   const liveSessionId = newOpaqueId('gls');
   const geminiMeta = () => ({ clientWsId, liveSessionId });
   let flutterAudioChunksIn = 0;
-
-  let flutterAudioChunksIn = 0;
   let lastGeminiErrorPayload = 'none';
   let proxyClosingClient = false;
   let proxyClosingGemini = false;
