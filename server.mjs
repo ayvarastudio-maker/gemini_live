@@ -13,7 +13,7 @@ import { GoogleGenAI, Modality } from '@google/genai';
 const PORT = Number(process.env.PORT || 8787);
 const API_KEY = process.env.GEMINI_API_KEY?.trim();
 const LIVE_MODEL =
-  process.env.LIVE_MODEL || 'gemini-2.0-flash-live-001';
+  process.env.LIVE_MODEL || 'gemini-2.5-flash-native-audio-latest';
 
 if (!API_KEY) {
   console.error('GEMINI_API_KEY is required.');
