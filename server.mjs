@@ -28,6 +28,23 @@ let geminiOutboundRequestCount = 0;
 
 const LOG_TAG_REQ = '[GEMINI_REQ_LOG]';
 const LOG_TAG_PROXY = '[GEMINI_PROXY_LOG]';
+const LOG_TAG_VOICE = '[VOICE_FLOW_LOG]';
+
+function logVoiceFlow(event, { clientWsId, liveSessionId, extra = '' }) {
+  const suffix = extra ? ` ${extra}` : '';
+  console.log(
+    `${LOG_TAG_VOICE} ts=${logTimestamp()} event=${event} clientWsId=${clientWsId} liveSessionId=${liveSessionId ?? 'n/a'}${suffix}`,
+  );
+}
+
+function audioByteLengthBase64(b64) {
+  if (!b64 || typeof b64 !== 'string') return 0;
+  try {
+    return Buffer.from(b64, 'base64').length;
+  } catch {
+    return 0;
+  }
+}
 
 function logTimestamp() {
   return new Date().toISOString();
@@ -140,8 +157,10 @@ wss.on('connection', async (clientWs, session, token) => {
   const clientWsId = newOpaqueId('cws');
   const liveSessionId = newOpaqueId('gls');
   const geminiMeta = () => ({ clientWsId, liveSessionId });
+  let flutterAudioChunksIn = 0;
 
   logProxyLifecycle('CLIENT_WS_CONNECT', { clientWsId, liveSessionId });
+  logVoiceFlow('client_connected', { clientWsId, liveSessionId });
 
   clientWs.on('close', () => {
     logProxyLifecycle('CLIENT_WS_DISCONNECT', { clientWsId, liveSessionId });
@@ -173,6 +192,10 @@ wss.on('connection', async (clientWs, session, token) => {
       callbacks: {
         onopen: () => {
           logProxyLifecycle('GEMINI_LIVE_SESSION_START', {
+            clientWsId,
+            liveSessionId,
+          });
+          logVoiceFlow('gemini_session_started', {
             clientWsId,
             liveSessionId,
           });
@@ -210,10 +233,21 @@ wss.on('connection', async (clientWs, session, token) => {
             if (part.inlineData?.data) {
               modelSpeaking = true;
               pushState('Konuşuyor');
+              const outBytes = audioByteLengthBase64(part.inlineData.data);
+              logVoiceFlow('gemini_audio_response_received', {
+                clientWsId,
+                liveSessionId,
+                extra: `bytes=${outBytes}`,
+              });
               sendClient(clientWs, {
                 type: 'audio',
                 mimeType: part.inlineData.mimeType || 'audio/pcm',
                 data: part.inlineData.data,
+              });
+              logVoiceFlow('audio_response_sent_to_flutter', {
+                clientWsId,
+                liveSessionId,
+                extra: `bytes=${outBytes}`,
               });
             }
             if (part.text) {
@@ -328,6 +362,20 @@ wss.on('connection', async (clientWs, session, token) => {
         switch (msg.type) {
           case 'audio':
             if (paused) break;
+            flutterAudioChunksIn += 1;
+            {
+              const inBytes = audioByteLengthBase64(msg.data);
+              if (
+                flutterAudioChunksIn === 1 ||
+                flutterAudioChunksIn % 50 === 0
+              ) {
+                logVoiceFlow('audio_chunk_received_from_flutter', {
+                  clientWsId,
+                  liveSessionId,
+                  extra: `bytes=${inBytes} chunkIndex=${flutterAudioChunksIn}`,
+                });
+              }
+            }
             await geminiSendRealtimeInput(
               liveSession,
               {
@@ -339,6 +387,16 @@ wss.on('connection', async (clientWs, session, token) => {
               geminiMeta(),
               'audio',
             );
+            if (
+              flutterAudioChunksIn === 1 ||
+              flutterAudioChunksIn % 50 === 0
+            ) {
+              logVoiceFlow('audio_chunk_sent_to_gemini', {
+                clientWsId,
+                liveSessionId,
+                extra: `chunkIndex=${flutterAudioChunksIn}`,
+              });
+            }
             if (!modelSpeaking) pushState('Dinliyorum');
             break;
           case 'text':
