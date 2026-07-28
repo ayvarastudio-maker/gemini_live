@@ -345,10 +345,7 @@ function modelResourceName() {
   return `models/${bare}`;
 }
 
-const LIVE_IMAGE_CONTEXT_TEXT =
-  'Bu görseli analiz et ve sonraki sorularımda bu görseli bağlam olarak kullan.';
-
-function buildLiveImageClientContent(mimeType, base64Data, text) {
+function buildLiveImageClientContent(mimeType, base64Data) {
   return {
     turns: [
       {
@@ -360,13 +357,10 @@ function buildLiveImageClientContent(mimeType, base64Data, text) {
               data: base64Data,
             },
           },
-          {
-            text: text || LIVE_IMAGE_CONTEXT_TEXT,
-          },
         ],
       },
     ],
-    turnComplete: true,
+    turnComplete: false,
   };
 }
 
@@ -730,13 +724,14 @@ wss.on('connection', async (clientWs, session, token) => {
                 liveSessionId,
                 extra: `mimeType=${mimeType} base64Len=${data.length}`,
               });
+              logVoiceFlow('live_image_silent_context_forward', {
+                clientWsId,
+                liveSessionId,
+                extra: `mimeType=${mimeType} turnComplete=false`,
+              });
               await geminiSendClientContent(
                 liveSession,
-                buildLiveImageClientContent(
-                  mimeType,
-                  data,
-                  msg.text?.toString(),
-                ),
+                buildLiveImageClientContent(mimeType, data),
                 geminiMeta(),
               );
             } catch (err) {
