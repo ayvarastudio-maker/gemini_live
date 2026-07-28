@@ -360,7 +360,7 @@ function buildLiveImageClientContent(mimeType, base64Data) {
         ],
       },
     ],
-    turnComplete: false,
+    turnComplete: true,
   };
 }
 
@@ -595,6 +595,8 @@ wss.on('connection', async (clientWs, session, token) => {
   let firstAudioForwardedLogged = false;
   let setupCompleteHandled = false;
   let liveImageForwarded = false;
+  let suppressModelAudioUntilFirstUserStreamEnd = false;
+  let firstUserStreamEndReceived = false;
   const turnWatch = {
     streamEndForwarded: false,
     logOutboundAfterStreamEnd: false,
@@ -734,6 +736,8 @@ wss.on('connection', async (clientWs, session, token) => {
                 buildLiveImageClientContent(mimeType, data),
                 geminiMeta(),
               );
+              suppressModelAudioUntilFirstUserStreamEnd = true;
+              firstUserStreamEndReceived = false;
             } catch (err) {
               liveImageForwarded = false;
               sendClient(clientWs, {
@@ -824,6 +828,11 @@ wss.on('connection', async (clientWs, session, token) => {
           break;
         case 'audioStreamEnd':
           if (!geminiSetupComplete) break;
+          if (!firstUserStreamEndReceived) {
+            firstUserStreamEndReceived = true;
+            suppressModelAudioUntilFirstUserStreamEnd = false;
+            logSpeechDiag('first_user_stream_end_unlocks_model_audio', geminiMeta(), {});
+          }
           logSpeechDiag('flutter_audio_stream_end_received', geminiMeta(), {});
           logSpeechDiag('automatic_activity_detection', geminiMeta(), {
             enabled: turnWatch.automaticActivityDetectionEnabled,
@@ -1024,6 +1033,19 @@ wss.on('connection', async (clientWs, session, token) => {
           }
           for (const part of parts) {
             if (part.inlineData?.data) {
+              if (
+                suppressModelAudioUntilFirstUserStreamEnd &&
+                !firstUserStreamEndReceived
+              ) {
+                logSpeechDiag(
+                  'model_audio_suppressed_awaiting_first_user_question',
+                  geminiMeta(),
+                  {
+                    mimeType: part.inlineData.mimeType || 'audio/pcm',
+                  },
+                );
+                continue;
+              }
               modelSpeaking = true;
               pushState('Konuşuyor');
               const mimeType = part.inlineData.mimeType || 'audio/pcm';
