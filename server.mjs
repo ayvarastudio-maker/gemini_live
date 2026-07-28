@@ -345,6 +345,31 @@ function modelResourceName() {
   return `models/${bare}`;
 }
 
+const LIVE_IMAGE_CONTEXT_TEXT =
+  'Bu görseli analiz et ve sonraki sorularımda bu görseli bağlam olarak kullan.';
+
+function buildLiveImageClientContent(mimeType, base64Data, text) {
+  return {
+    turns: [
+      {
+        role: 'user',
+        parts: [
+          {
+            inlineData: {
+              mimeType,
+              data: base64Data,
+            },
+          },
+          {
+            text: text || LIVE_IMAGE_CONTEXT_TEXT,
+          },
+        ],
+      },
+    ],
+    turnComplete: true,
+  };
+}
+
 const LIVE_TURKISH_SYSTEM_INSTRUCTION = {
   parts: [
     {
@@ -575,6 +600,7 @@ wss.on('connection', async (clientWs, session, token) => {
   let firstFlutterAudioLogged = false;
   let firstAudioForwardedLogged = false;
   let setupCompleteHandled = false;
+  let liveImageForwarded = false;
   const turnWatch = {
     streamEndForwarded: false,
     logOutboundAfterStreamEnd: false,
@@ -584,11 +610,12 @@ wss.on('connection', async (clientWs, session, token) => {
   const onGeminiSetupComplete = () => {
     if (setupCompleteHandled) return;
     setupCompleteHandled = true;
-    logVoiceFlow('initial_client_content_seed_disabled', {
+    logVoiceFlow('gemini_setup_complete_notify_flutter', {
       clientWsId,
       liveSessionId,
     });
-    sendMicReadyOnce();
+    sendClient(clientWs, { type: 'setupComplete' });
+    scheduleMicReadyFallback();
   };
 
   const sendMicReadyOnce = () => {
@@ -682,6 +709,46 @@ wss.on('connection', async (clientWs, session, token) => {
     try {
       const msg = JSON.parse(raw.toString());
       switch (msg.type) {
+        case 'liveImage':
+          if (!geminiSetupComplete || !liveSession) break;
+          if (liveImageForwarded) break;
+          {
+            const mimeType = (msg.mimeType || 'image/jpeg').toString();
+            const data = msg.data?.toString() ?? '';
+            if (!data) {
+              sendClient(clientWs, {
+                type: 'error',
+                message: 'liveImage: empty data',
+              });
+              sendMicReadyOnce();
+              break;
+            }
+            liveImageForwarded = true;
+            try {
+              logVoiceFlow('live_image_forward_to_gemini', {
+                clientWsId,
+                liveSessionId,
+                extra: `mimeType=${mimeType} base64Len=${data.length}`,
+              });
+              await geminiSendClientContent(
+                liveSession,
+                buildLiveImageClientContent(
+                  mimeType,
+                  data,
+                  msg.text?.toString(),
+                ),
+                geminiMeta(),
+              );
+            } catch (err) {
+              liveImageForwarded = false;
+              sendClient(clientWs, {
+                type: 'error',
+                message: `liveImage: ${String(err)}`,
+              });
+            }
+            sendMicReadyOnce();
+          }
+          break;
         case 'audio':
           if (paused || !liveSession) break;
           if (!geminiSetupComplete) {
